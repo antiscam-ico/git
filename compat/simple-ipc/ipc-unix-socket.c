@@ -6,8 +6,12 @@
 #include "unix-socket.h"
 #include "unix-stream-server.h"
 
-#ifdef NO_UNIX_SOCKETS
-#error compat/simple-ipc/ipc-unix-socket.c requires Unix sockets
+#ifndef SUPPORTS_SIMPLE_IPC
+/*
+ * This source file should only be compiled when Simple IPC is supported.
+ * See the top-level Makefile.
+ */
+#error SUPPORTS_SIMPLE_IPC not defined
 #endif
 
 enum ipc_active_state ipc_get_active_state(const char *path)
@@ -47,7 +51,11 @@ enum ipc_active_state ipc_get_active_state(const char *path)
 }
 
 /*
- * This value was chosen at random.
+ * Retry frequency when trying to connect to a server.
+ *
+ * This value should be short enough that we don't seriously delay our
+ * caller, but not fast enough that our spinning puts pressure on the
+ * system.
  */
 #define WAIT_STEP_MS (50)
 
@@ -61,12 +69,11 @@ static enum ipc_active_state connect_to_server(
 	const struct ipc_client_connect_options *options,
 	int *pfd)
 {
-	int wait_ms = 50;
 	int k;
 
 	*pfd = -1;
 
-	for (k = 0; k < timeout_ms; k += wait_ms) {
+	for (k = 0; k < timeout_ms; k += WAIT_STEP_MS) {
 		int fd = unix_stream_connect(path, options->uds_disallow_chdir);
 
 		if (fd != -1) {
@@ -98,14 +105,25 @@ static enum ipc_active_state connect_to_server(
 		return IPC_STATE__OTHER_ERROR;
 
 	sleep_and_try_again:
-		sleep_millisec(wait_ms);
+		sleep_millisec(WAIT_STEP_MS);
 	}
 
 	return IPC_STATE__NOT_LISTENING;
 }
 
 /*
- * A randomly chosen timeout value.
+ * The total amount of time that we are willing to wait when trying to
+ * connect to a server.
+ *
+ * When the server is first started, it might take a little while for
+ * it to become ready to service requests.  Likewise, the server may
+ * be very (temporarily) busy and not respond to our connections.
+ *
+ * We should gracefully and silently handle those conditions and try
+ * again for a reasonable time period.
+ *
+ * The value chosen here should be long enough for the server
+ * to reliably heal from the above conditions.
  */
 #define MY_CONNECTION_TIMEOUT_MS (1000)
 
@@ -150,7 +168,8 @@ void ipc_client_close_connection(struct ipc_client_connection *connection)
 
 int ipc_client_send_command_to_connection(
 	struct ipc_client_connection *connection,
-	const char *message, struct strbuf *answer)
+	const char *message, size_t message_len,
+	struct strbuf *answer)
 {
 	int ret = 0;
 
@@ -158,7 +177,7 @@ int ipc_client_send_command_to_connection(
 
 	trace2_region_enter("ipc-client", "send-command", NULL);
 
-	if (write_packetized_from_buf_no_flush(message, strlen(message),
+	if (write_packetized_from_buf_no_flush(message, message_len,
 					       connection->fd) < 0 ||
 	    packet_flush_gently(connection->fd) < 0) {
 		ret = error(_("could not send IPC command"));
@@ -179,7 +198,8 @@ done:
 
 int ipc_client_send_command(const char *path,
 			    const struct ipc_client_connect_options *options,
-			    const char *message, struct strbuf *answer)
+			    const char *message, size_t message_len,
+			    struct strbuf *answer)
 {
 	int ret = -1;
 	enum ipc_active_state state;
@@ -190,7 +210,9 @@ int ipc_client_send_command(const char *path,
 	if (state != IPC_STATE__LISTENING)
 		return ret;
 
-	ret = ipc_client_send_command_to_connection(connection, message, answer);
+	ret = ipc_client_send_command_to_connection(connection,
+						    message, message_len,
+						    answer);
 
 	ipc_client_close_connection(connection);
 
@@ -244,7 +266,7 @@ struct ipc_accept_thread_data {
 	enum magic magic;
 	struct ipc_server_data *server_data;
 
-	struct unix_stream_server_socket *server_socket;
+	struct unix_ss_socket *server_socket;
 
 	int fd_send_shutdown;
 	int fd_wait_shutdown;
@@ -485,7 +507,7 @@ static int worker_thread__do_io(
 	if (ret >= 0) {
 		ret = worker_thread_data->server_data->application_cb(
 			worker_thread_data->server_data->application_data,
-			buf.buf, do_io_reply_callback, &reply_data);
+			buf.buf, buf.len, do_io_reply_callback, &reply_data);
 
 		packet_flush_gently(reply_data.fd);
 	}
@@ -621,7 +643,7 @@ static int accept_thread__wait_for_connection(
 			 * will be routed elsewhere and we silently starve.
 			 * If that happens, just queue a shutdown.
 			 */
-			if (unix_stream_server__was_stolen(
+			if (unix_ss_was_stolen(
 				    accept_thread_data->server_socket)) {
 				trace2_data_string("ipc-accept", NULL,
 						   "queue_stop_async",
@@ -732,22 +754,22 @@ static void *accept_thread_proc(void *_accept_thread_data)
 static int create_listener_socket(
 	const char *path,
 	const struct ipc_server_opts *ipc_opts,
-	struct unix_stream_server_socket **new_server_socket)
+	struct unix_ss_socket **new_server_socket)
 {
-	struct unix_stream_server_socket *server_socket = NULL;
+	struct unix_ss_socket *server_socket = NULL;
 	struct unix_stream_listen_opts uslg_opts = UNIX_STREAM_LISTEN_OPTS_INIT;
 	int ret;
 
 	uslg_opts.listen_backlog_size = LISTEN_BACKLOG;
 	uslg_opts.disallow_chdir = ipc_opts->uds_disallow_chdir;
 
-	ret = unix_stream_server__create(path, &uslg_opts, -1, &server_socket);
+	ret = unix_ss_create(path, &uslg_opts, -1, &server_socket);
 	if (ret)
 		return ret;
 
 	if (set_socket_blocking_flag(server_socket->fd_socket, 1)) {
 		int saved_errno = errno;
-		unix_stream_server__free(server_socket);
+		unix_ss_free(server_socket);
 		errno = saved_errno;
 		return -1;
 	}
@@ -761,7 +783,7 @@ static int create_listener_socket(
 static int setup_listener_socket(
 	const char *path,
 	const struct ipc_server_opts *ipc_opts,
-	struct unix_stream_server_socket **new_server_socket)
+	struct unix_ss_socket **new_server_socket)
 {
 	int ret, saved_errno;
 
@@ -784,7 +806,7 @@ int ipc_server_run_async(struct ipc_server_data **returned_server_data,
 			 ipc_server_application_cb *application_cb,
 			 void *application_data)
 {
-	struct unix_stream_server_socket *server_socket = NULL;
+	struct unix_ss_socket *server_socket = NULL;
 	struct ipc_server_data *server_data;
 	int sv[2];
 	int k;
@@ -833,8 +855,7 @@ int ipc_server_run_async(struct ipc_server_data **returned_server_data,
 	pthread_cond_init(&server_data->work_available_cond, NULL);
 
 	server_data->queue_size = nr_threads * FIFO_SCALE;
-	server_data->fifo_fds = xcalloc(server_data->queue_size,
-					sizeof(*server_data->fifo_fds));
+	CALLOC_ARRAY(server_data->fifo_fds, server_data->queue_size);
 
 	server_data->accept_thread =
 		xcalloc(1, sizeof(*server_data->accept_thread));
@@ -958,7 +979,7 @@ void ipc_server_free(struct ipc_server_data *server_data)
 
 	accept_thread_data = server_data->accept_thread;
 	if (accept_thread_data) {
-		unix_stream_server__free(accept_thread_data->server_socket);
+		unix_ss_free(accept_thread_data->server_socket);
 
 		if (accept_thread_data->fd_send_shutdown != -1)
 			close(accept_thread_data->fd_send_shutdown);
