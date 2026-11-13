@@ -1,8 +1,14 @@
-#include "cache.h"
+#include "git-compat-util.h"
+#include "abspath.h"
+#include "gettext.h"
 #include "simple-ipc.h"
 #include "strbuf.h"
 #include "pkt-line.h"
 #include "thread-utils.h"
+#include "trace.h"
+#include "trace2.h"
+#include "accctrl.h"
+#include "aclapi.h"
 
 #ifndef SUPPORTS_SIMPLE_IPC
 /*
@@ -112,13 +118,14 @@ static enum ipc_active_state connect_to_server(
 			t_start_ms = (DWORD)(getnanotime() / 1000000);
 
 			if (!WaitNamedPipeW(wpath, timeout_ms)) {
-				if (GetLastError() == ERROR_SEM_TIMEOUT)
+				DWORD gleWait = GetLastError();
+
+				if (gleWait == ERROR_SEM_TIMEOUT)
 					return IPC_STATE__NOT_LISTENING;
 
-				gle = GetLastError();
 				trace2_data_intmax("ipc-debug", NULL,
 						   "connect/waitpipe/gle",
-						   (intmax_t)gle);
+						   (intmax_t)gleWait);
 
 				return IPC_STATE__OTHER_ERROR;
 			}
@@ -364,6 +371,9 @@ struct ipc_server_data {
 	HANDLE hEventStopRequested;
 	struct ipc_server_thread_data *thread_list;
 	int is_stopped;
+
+	pthread_mutex_t startup_barrier;
+	int started;
 };
 
 enum connect_result {
@@ -519,6 +529,16 @@ static int use_connection(struct ipc_server_thread_data *server_thread_data)
 	return ret;
 }
 
+static void wait_for_startup_barrier(struct ipc_server_data *server_data)
+{
+	/*
+	 * Temporarily hold the startup_barrier mutex before starting,
+	 * which lets us know that it's OK to start serving requests.
+	 */
+	pthread_mutex_lock(&server_data->startup_barrier);
+	pthread_mutex_unlock(&server_data->startup_barrier);
+}
+
 /*
  * Thread proc for an IPC server worker thread.  It handles a series of
  * connections from clients.  It cleans and reuses the hPipe between each
@@ -542,6 +562,8 @@ static void *server_thread_proc(void *_server_thread_data)
 
 	memset(&oConnect, 0, sizeof(oConnect));
 	oConnect.hEvent = hEventConnected;
+
+	wait_for_startup_barrier(server_thread_data->server_data);
 
 	for (;;) {
 		cr = wait_for_connection(server_thread_data, &oConnect);
@@ -591,11 +613,132 @@ finished:
 	return NULL;
 }
 
+/*
+ * We need to build a Windows "SECURITY_ATTRIBUTES" object and use it
+ * to apply an ACL when we create the initial instance of the Named
+ * Pipe.  The construction is somewhat involved and consists of
+ * several sequential steps and intermediate objects.
+ *
+ * We use this structure to hold these intermediate pointers so that
+ * we can free them as a group.  (It is unclear from the docs whether
+ * some of these intermediate pointers can be freed before we are
+ * finished using the "lpSA" member.)
+ */
+struct my_sa_data
+{
+	PSID pEveryoneSID;
+	PACL pACL;
+	PSECURITY_DESCRIPTOR pSD;
+	LPSECURITY_ATTRIBUTES lpSA;
+};
+
+static void init_sa(struct my_sa_data *d)
+{
+	memset(d, 0, sizeof(*d));
+}
+
+static void release_sa(struct my_sa_data *d)
+{
+	if (d->pEveryoneSID)
+		FreeSid(d->pEveryoneSID);
+	if (d->pACL)
+		LocalFree(d->pACL);
+	if (d->pSD)
+		LocalFree(d->pSD);
+	if (d->lpSA)
+		LocalFree(d->lpSA);
+
+	memset(d, 0, sizeof(*d));
+}
+
+/*
+ * Create SECURITY_ATTRIBUTES to apply to the initial named pipe.  The
+ * creator of the first server instance gets to set the ACLs on it.
+ *
+ * We allow the well-known group `EVERYONE` to have read+write access
+ * to the named pipe so that clients can send queries to the daemon
+ * and receive the response.
+ *
+ * Normally, this is not necessary since the daemon is usually
+ * automatically started by a foreground command like `git status`,
+ * but in those cases where an elevated Git command started the daemon
+ * (such that the daemon itself runs with elevation), we need to add
+ * the ACL so that non-elevated commands can write to it.
+ *
+ * The following document was helpful:
+ * https://docs.microsoft.com/en-us/windows/win32/secauthz/creating-a-security-descriptor-for-a-new-object-in-c--
+ *
+ * Returns d->lpSA set to a SA or NULL.
+ */
+static LPSECURITY_ATTRIBUTES get_sa(struct my_sa_data *d)
+{
+	SID_IDENTIFIER_AUTHORITY sid_auth_world = SECURITY_WORLD_SID_AUTHORITY;
+#define NR_EA (1)
+	EXPLICIT_ACCESS ea[NR_EA];
+	DWORD dwResult;
+
+	if (!AllocateAndInitializeSid(&sid_auth_world, 1,
+				      SECURITY_WORLD_RID, 0,0,0,0,0,0,0,
+				      &d->pEveryoneSID)) {
+		DWORD gle = GetLastError();
+		trace2_data_intmax("ipc-debug", NULL, "alloc-world-sid/gle",
+				   (intmax_t)gle);
+		goto fail;
+	}
+
+	MEMZERO_ARRAY(ea, NR_EA);
+
+	ea[0].grfAccessPermissions = GENERIC_READ | GENERIC_WRITE;
+	ea[0].grfAccessMode = SET_ACCESS;
+	ea[0].grfInheritance = NO_INHERITANCE;
+	ea[0].Trustee.MultipleTrusteeOperation = NO_MULTIPLE_TRUSTEE;
+	ea[0].Trustee.TrusteeForm = TRUSTEE_IS_SID;
+	ea[0].Trustee.TrusteeType = TRUSTEE_IS_WELL_KNOWN_GROUP;
+	ea[0].Trustee.ptstrName = (LPTSTR)d->pEveryoneSID;
+
+	dwResult = SetEntriesInAcl(NR_EA, ea, NULL, &d->pACL);
+	if (dwResult != ERROR_SUCCESS) {
+		DWORD gle = GetLastError();
+		trace2_data_intmax("ipc-debug", NULL, "set-acl-entry/gle",
+				   (intmax_t)gle);
+		trace2_data_intmax("ipc-debug", NULL, "set-acl-entry/dw",
+				   (intmax_t)dwResult);
+		goto fail;
+	}
+
+	d->pSD = (PSECURITY_DESCRIPTOR)LocalAlloc(
+		LPTR, SECURITY_DESCRIPTOR_MIN_LENGTH);
+	if (!InitializeSecurityDescriptor(d->pSD, SECURITY_DESCRIPTOR_REVISION)) {
+		DWORD gle = GetLastError();
+		trace2_data_intmax("ipc-debug", NULL, "init-sd/gle", (intmax_t)gle);
+		goto fail;
+	}
+
+	if (!SetSecurityDescriptorDacl(d->pSD, TRUE, d->pACL, FALSE)) {
+		DWORD gle = GetLastError();
+		trace2_data_intmax("ipc-debug", NULL, "set-sd-dacl/gle", (intmax_t)gle);
+		goto fail;
+	}
+
+	d->lpSA = (LPSECURITY_ATTRIBUTES)LocalAlloc(LPTR, sizeof(SECURITY_ATTRIBUTES));
+	d->lpSA->nLength = sizeof(SECURITY_ATTRIBUTES);
+	d->lpSA->lpSecurityDescriptor = d->pSD;
+	d->lpSA->bInheritHandle = FALSE;
+
+	return d->lpSA;
+
+fail:
+	release_sa(d);
+	return NULL;
+}
+
 static HANDLE create_new_pipe(wchar_t *wpath, int is_first)
 {
 	HANDLE hPipe;
 	DWORD dwOpenMode, dwPipeMode;
-	LPSECURITY_ATTRIBUTES lpsa = NULL;
+	struct my_sa_data my_sa_data;
+
+	init_sa(&my_sa_data);
 
 	dwOpenMode = PIPE_ACCESS_INBOUND | PIPE_ACCESS_OUTBOUND |
 		FILE_FLAG_OVERLAPPED;
@@ -611,28 +754,23 @@ static HANDLE create_new_pipe(wchar_t *wpath, int is_first)
 		 * set the ACL / Security Attributes on the named
 		 * pipe; subsequent instances inherit and cannot
 		 * change them.
-		 *
-		 * TODO Should we allow the application layer to
-		 * specify security attributes, such as `LocalService`
-		 * or `LocalSystem`, when we create the named pipe?
-		 * This question is probably not important when the
-		 * daemon is started by a foreground user process and
-		 * only needs to talk to the current user, but may be
-		 * if the daemon is run via the Control Panel as a
-		 * System Service.
 		 */
+		get_sa(&my_sa_data);
 	}
 
 	hPipe = CreateNamedPipeW(wpath, dwOpenMode, dwPipeMode,
-				 PIPE_UNLIMITED_INSTANCES, 1024, 1024, 0, lpsa);
+				 PIPE_UNLIMITED_INSTANCES, 1024, 1024, 0,
+				 my_sa_data.lpSA);
+
+	release_sa(&my_sa_data);
 
 	return hPipe;
 }
 
-int ipc_server_run_async(struct ipc_server_data **returned_server_data,
-			 const char *path, const struct ipc_server_opts *opts,
-			 ipc_server_application_cb *application_cb,
-			 void *application_data)
+int ipc_server_init_async(struct ipc_server_data **returned_server_data,
+			  const char *path, const struct ipc_server_opts *opts,
+			  ipc_server_application_cb *application_cb,
+			  void *application_data)
 {
 	struct ipc_server_data *server_data;
 	wchar_t wpath[MAX_PATH];
@@ -663,6 +801,13 @@ int ipc_server_run_async(struct ipc_server_data **returned_server_data,
 	strbuf_init(&server_data->buf_path, 0);
 	strbuf_addstr(&server_data->buf_path, path);
 	wcscpy(server_data->wpath, wpath);
+
+	/*
+	 * Hold the startup_barrier lock so that no threads will progress
+	 * until ipc_server_start_async() is called.
+	 */
+	pthread_mutex_init(&server_data->startup_barrier, NULL);
+	pthread_mutex_lock(&server_data->startup_barrier);
 
 	if (nr_threads < 1)
 		nr_threads = 1;
@@ -714,6 +859,15 @@ int ipc_server_run_async(struct ipc_server_data **returned_server_data,
 	return 0;
 }
 
+void ipc_server_start_async(struct ipc_server_data *server_data)
+{
+	if (!server_data || server_data->started)
+		return;
+
+	server_data->started = 1;
+	pthread_mutex_unlock(&server_data->startup_barrier);
+}
+
 int ipc_server_stop_async(struct ipc_server_data *server_data)
 {
 	if (!server_data)
@@ -727,6 +881,13 @@ int ipc_server_stop_async(struct ipc_server_data *server_data)
 	 * We DO NOT attempt to force them to drop an active connection.
 	 */
 	SetEvent(server_data->hEventStopRequested);
+
+	/*
+	 * If we haven't yet told the threads they are allowed to run,
+	 * do so now, so they can receive the shutdown event.
+	 */
+	ipc_server_start_async(server_data);
+
 	return 0;
 }
 
@@ -776,6 +937,8 @@ void ipc_server_free(struct ipc_server_data *server_data)
 		server_data->thread_list = std->next_thread;
 		free(std);
 	}
+
+	pthread_mutex_destroy(&server_data->startup_barrier);
 
 	free(server_data);
 }

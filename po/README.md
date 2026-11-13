@@ -1,21 +1,26 @@
-Core GIT Translations
-=====================
+# Core GIT Translations
 
 This directory holds the translations for the core of Git. This document
 describes how you can contribute to the effort of enhancing the language
 coverage and maintaining the translation.
 
 The localization (l10n) coordinator, Jiang Xin <worldhello.net@gmail.com>,
-coordinates our localization effort in the l10 coordinator repository:
+coordinates our localization effort in the l10n coordinator repository:
 
-        https://github.com/git-l10n/git-po/
+    https://github.com/git-l10n/git-po/
 
-The two character language translation codes are defined by ISO_639-1, as
-stated in the gettext(1) full manual, appendix A.1, Usual Language Codes.
+We will use XX as an alias to refer to the language translation code in
+the following paragraphs, for example we use "po/XX.po" to refer to the
+translation file for a specific language. But this doesn't mean that
+the language code has only two letters. The language code can be in one
+of two forms: "ll" or "ll\_CC". Here "ll" is the ISO 639 two-letter
+language code and "CC" is the ISO 3166 two-letter code for country names
+and subdivisions. For example: "de" for German language code, "zh\_CN"
+for Simplified Chinese language code.
 
 
-Contributing to an existing translation
----------------------------------------
+## Contributing to an existing translation
+
 As a contributor for a language XX, you should first check TEAMS file in
 this directory to see whether a dedicated repository for your language XX
 exists. Fork the dedicated repository and start to work if it exists.
@@ -28,10 +33,10 @@ For this case, wrong translations should be reported and fixed through
 their workflows.
 
 
-Creating a new language translation
------------------------------------
+## Creating a new language translation
+
 If you are the first contributor for the language XX, please fork this
-repository, prepare and/or update the translated message file po/XX.po
+repository, prepare and/or update the translated message file "po/XX.po"
 (described later), and ask the l10n coordinator to pull your work.
 
 If there are multiple contributors for the same language, please first
@@ -40,127 +45,122 @@ language, so that the l10n coordinator only needs to interact with one
 person per language.
 
 
-Core translation
-----------------
-The core translation is the smallest set of work that must be completed
-for a new language translation. Because there are more than 5000 messages
-in the template message file "po/git.pot" that need to be translated,
-this is not a piece of cake for the contributor for a new language.
+## Translation Process Flow
 
-The core template message file which contains a small set of messages
-will be generated in "po-core/core.pot" automatically by running a helper
-program named "git-po-helper" (described later).
-
-    git-po-helper init --core XX.po
-
-After translating the generated "po-core/XX.po", you can merge it to
-"po/XX.po" using the following commands:
-
-    msgcat po-core/XX.po po/XX.po -s -o /tmp/XX.po
-    mv /tmp/XX.po po/XX.po
-    git-po-helper update XX.po
-
-Edit "po/XX.po" by hand to fix "fuzzy" messages, which may have misplaced
-translated messages and duplicate messages.
-
-
-Translation Process Flow
-------------------------
 The overall data-flow looks like this:
 
-    +-------------------+            +------------------+
-    | Git source code   | ---(1)---> | L10n coordinator |
-    | repository        | <---(4)--- | repository       |
-    +-------------------+            +------------------+
-                                          |      ^
-                                         (2)    (3)
-                                          V      |
-                                     +------------------+
-                                     | Language Team XX |
-                                     +------------------+
+    +-------------------+             +------------------+
+    | Git source code   | ----(2)---> | L10n coordinator |
+    | repository        | <---(5)---- | repository       |
+    +-------------------+             +------------------+
+                    |                     |    ^
+                   (1)                   (3)  (4)
+                    V                     v    |
+               +----------------------------------+
+               |        Language Team XX          |
+               +----------------------------------+
 
- * Translatable strings are marked in the source file.
- * L10n coordinator pulls from the source (1)
- * L10n coordinator updates the message template po/git.pot
- * Language team pulls from L10n coordinator (2)
- * Language team updates the message file po/XX.po
- * L10n coordinator pulls from Language team (3)
- * L10n coordinator asks the result to be pulled (4).
+- Translatable strings are marked in the source file.
+- Language teams can start translation iterations at any time, even
+  before the l10n window opens:
 
+  + Pull from the master branch of the source (1)
+  + Update the message file by running "make po-update PO\_FILE=po/XX.po"
+  + Translate the message file "po/XX.po"
 
-Maintaining the po/git.pot file
--------------------------------
+- The L10n coordinator pulls from source and announces the l10n window
+  open (2)
+- Language team pulls from the l10n coordinator, starts another
+  translation iteration against the l10n coordinator's tree (3)
 
-(This is done by the l10n coordinator).
+  + Run "git pull --rebase" from the l10n coordinator
+  + Update the message file by running "make po-update PO\_FILE=po/XX.po"
+  + Translate the message file "po/XX.po"
+  + Squash trivial l10n git commits using "git rebase -i"
 
-The po/git.pot file contains a message catalog extracted from Git's
-sources. The l10n coordinator maintains it by adding new translations with
-msginit(1), or update existing ones with msgmerge(1).  In order to update
-the Git sources to extract the messages from, the l10n coordinator is
-expected to pull from the main git repository at strategic point in
-history (e.g. when a major release and release candidates are tagged),
-and then run "make pot" at the top-level directory.
-
-Language contributors use this file to prepare translations for their
-language, but they are not expected to modify it.
+- Language team sends pull request to the l10n coordinator (4)
+- L10n coordinator checks and merges
+- L10n coordinator asks the result to be pulled (5).
 
 
-Initializing a XX.po file
--------------------------
+## Dynamically generated POT files
+
+POT files are templates for l10n contributors to create or update their
+translation files. We used to have the "po/git.pot" file which was
+generated by the l10n coordinator, but this file had been removed from
+the tree.
+
+The two POT files "po/git.pot" and "po/git-core.pot" can be created
+dynamically when necessary.
+
+L10n contributors use "po/git.pot" to prepare translations for their
+languages, but they are not expected to modify it. The "po/git.pot" file
+can be generated manually with the following command:
+
+```shell
+make po/git.pot
+```
+
+The "po/git-core.pot" file is the template for core translations. A core
+translation is the minimum set of work necessary to complete a
+translation of a new language. Since there are more than 5000 messages
+in the full set of template message file "po/git.pot" that need to be
+translated, this is not a piece of cake for new language contributors.
+
+The "core" template file "po/git-core.pot" can be generated manually
+by running:
+
+```shell
+make po/git-core.pot
+```
+
+
+## Initializing a "XX.po" file
 
 (This is done by the language teams).
 
-If your language XX does not have translated message file po/XX.po yet,
+If your language XX does not have translated message file "po/XX.po" yet,
 you add a translation for the first time by running:
 
-    msginit --locale=XX
+```shell
+make po-init PO_FILE=po/XX.po
+```
 
-in the po/ directory, where XX is the locale, e.g. "de", "is", "pt_BR",
-"zh_CN", etc.
+where XX is the locale, e.g. "de", "is", "pt\_BR", "zh\_CN", etc.
 
-Then edit the automatically generated copyright info in your new XX.po
-to be correct, e.g. for Icelandic:
-
-    @@ -1,6 +1,6 @@
-    -# Icelandic translations for PACKAGE package.
-    -# Copyright (C) 2010 THE PACKAGE'S COPYRIGHT HOLDER
-    -# This file is distributed under the same license as the PACKAGE package.
-    +# Icelandic translations for Git.
-    +# Copyright (C) 2010 Ævar Arnfjörð Bjarmason <avarab@gmail.com>
-    +# This file is distributed under the same license as the Git package.
-     # Ævar Arnfjörð Bjarmason <avarab@gmail.com>, 2010.
-
-And change references to PACKAGE VERSION in the PO Header Entry to
-just "Git":
-
-    perl -pi -e 's/(?<="Project-Id-Version: )PACKAGE VERSION/Git/' XX.po
+The newly generated message file "po/XX.po" is based on the core pot
+file "po/git-core.pot", so it contains only a minimal set of messages
+and it's a good start for a new language contribution.
 
 Once you are done testing the translation (see below), commit the result
 and ask the l10n coordinator to pull from you.
 
 
-Updating a XX.po file
----------------------
+## Updating a "XX.po" file
 
 (This is done by the language teams).
 
-If you are replacing translation strings in an existing XX.po file to
+If you are replacing translation strings in an existing "XX.po" file to
 improve the translation, just edit the file.
 
-If there's an existing XX.po file for your language, but the repository
-of the l10n coordinator has newer po/git.pot file, you would need to first
-pull from the l10n coordinator (see the beginning of this document for its
-URL), and then update the existing translation by running:
+If you want to find new translatable strings in source files of upstream
+repository and propagate them to your "po/XX.po", run command:
 
-    msgmerge --add-location --backup=off -U XX.po git.pot
+```shell
+make po-update PO_FILE=po/XX.po
+```
 
-in the po/ directory, where XX.po is the file you want to update.
+It will:
 
-Once you are done testing the translation (see below), commit the result
-and ask the l10n coordinator to pull from you.
+- Call "make po/git.pot" to generate new "po/git.pot" file
+- Call "msgmerge --add-location --backup=off -U po/XX.po po/git.pot"
+  to update your "po/XX.po"
+- The "--add-location" option for msgmerge will add location lines,
+  and these location lines will help translation tools to locate
+  translation context easily.
 
-Fuzzy translation
------------------
+
+## Fuzzy translation
 
 Fuzzy translation is a translation marked by comment "fuzzy" to let you
 know that the translation is out of date because the "msgid" has been
@@ -172,14 +172,15 @@ After fixing the corresponding translation, you must remove the "fuzzy"
 tag in the comment.
 
 
-Testing your changes
---------------------
+## Testing your changes
 
-(This is done by the language teams, after creating or updating XX.po file).
+(This is done by the language teams, after creating or updating "XX.po" file).
 
 Before you submit your changes go back to the top-level and do:
 
-    make
+```shell
+make
+```
 
 On systems with GNU gettext (i.e. not Solaris) this will compile your
 changed PO file with `msgfmt --check`, the --check option flags many
@@ -187,9 +188,55 @@ common errors, e.g. missing printf format strings, or translated
 messages that deviate from the originals in whether they begin/end
 with a newline or not.
 
+L10n coordinator will check your contributions using a helper program
+(see "PO helper" section below):
 
-Marking strings for translation
--------------------------------
+```shell
+git-po-helper check-po po/XX.po
+git-po-helper check-commits <rev-list-opts>
+```
+
+
+## Preparing a "XX.po" file for commit
+
+Once you are done testing the translation, it's better to commit a
+location-less "po/XX.po" file to save repository space and make a
+user-friendly patch for review.
+
+To save a location-less "po/XX.po" automatically in the repository,
+follow these steps:
+
+First, check which filter is configured for your "po/XX.po" file:
+
+```
+git check-attr filter po/XX.po
+```
+
+The filter configuration is defined in the "po/.gitattributes" file.
+
+Then define the driver for the filter. Most languages use the
+"gettext-no-location" clean filter, which strips out both filenames and line
+numbers from location comments. To set this up, run the following command:
+
+```shell
+git config --global filter.gettext-no-location.clean \
+           "msgcat --no-location -"
+```
+
+Some PO files use the "gettext-no-line-number" clean filter, which keeps
+filenames but strips line numbers. This filter requires gettext 0.20 or
+later. The only benefit is being able to locate source files from location
+comments when the .po file is not updated from the POT via `make po-update`.
+
+```shell
+git config --global filter.gettext-no-line-number.clean \
+           "msgcat --add-location=file -"
+```
+
+You're now ready to ask the l10n coordinator to pull from you.
+
+
+## Marking strings for translation
 
 (This is done by the core developers).
 
@@ -202,199 +249,233 @@ gettext library, so most of the advice in your gettext documentation
 
 General advice:
 
- - Don't mark everything for translation, only strings which will be
-   read by humans (the porcelain interface) should be translated.
+- Don't mark everything for translation, only strings which will be
+  read by humans (the porcelain interface) should be translated.
 
-   The output from Git's plumbing utilities will primarily be read by
-   programs and would break scripts under non-C locales if it was
-   translated. Plumbing strings should not be translated, since
-   they're part of Git's API.
+  The output from Git's plumbing utilities will primarily be read by
+  programs and would break scripts under non-C locales if it was
+  translated. Plumbing strings should not be translated, since
+  they're part of Git's API.
 
- - Adjust the strings so that they're easy to translate. Most of the
-   advice in `info '(gettext)Preparing Strings'` applies here.
+- Adjust the strings so that they're easy to translate. Most of the
+  advice in `info '(gettext)Preparing Strings'` applies here.
 
- - If something is unclear or ambiguous you can use a "TRANSLATORS"
-   comment to tell the translators what to make of it. These will be
-   extracted by xgettext(1) and put in the po/*.po files, e.g. from
-   git-am.sh:
+- Strings referencing numbers of items may need to be split into singular and
+  plural forms; see the Q\_() wrapper in the C sub-section below for an
+  example.
 
-       # TRANSLATORS: Make sure to include [y], [n], [e], [v] and [a]
-       # in your translation. The program will only accept English
-       # input at this point.
-       gettext "Apply? [y]es/[n]o/[e]dit/[v]iew patch/[a]ccept all "
+- If something is unclear or ambiguous you can use a "TRANSLATORS"
+  comment to tell the translators what to make of it. These will be
+  extracted by xgettext(1) and put in the "po/\*.po" files, e.g. from
+  git-am.sh:
 
-   Or in C, from builtin/revert.c:
+  ```shell
+  # TRANSLATORS: Make sure to include [y], [n], [e], [v] and [a]
+  # in your translation. The program will only accept English
+  # input at this point.
+  gettext "Apply? [y]es/[n]o/[e]dit/[v]iew patch/[a]ccept all "
+  ```
 
-       /* TRANSLATORS: %s will be "revert" or "cherry-pick" */
-       die(_("%s: Unable to write new index file"), action_name(opts));
+  Or in C, from builtin/revert.c:
+
+  ```c
+  /* TRANSLATORS: %s will be "revert" or "cherry-pick" */
+  die(_("%s: Unable to write new index file"), action_name(opts));
+  ```
 
 We provide wrappers for C, Shell and Perl programs. Here's how they're
 used:
 
-C:
 
- - Include builtin.h at the top, it'll pull in gettext.h, which
-   defines the gettext interface. Consult with the list if you need to
-   use gettext.h directly.
+### C
 
- - The C interface is a subset of the normal GNU gettext
-   interface. We currently export these functions:
+Include builtin.h at the top, it'll pull in gettext.h, which
+defines the gettext interface. Consult with the list if you need to
+use gettext.h directly.
 
-   - _()
+The C interface is a subset of the normal GNU gettext
+interface. We currently export these functions:
 
-    Mark and translate a string. E.g.:
+- \_()
 
-        printf(_("HEAD is now at %s"), hex);
+  Mark and translate a string. E.g.:
 
-   - Q_()
+  ```c
+  printf(_("HEAD is now at %s"), hex);
+  ```
 
-    Mark and translate a plural string. E.g.:
+- Q\_()
 
-        printf(Q_("%d commit", "%d commits", number_of_commits));
+  Mark and translate a plural string. E.g.:
 
-    This is just a wrapper for the ngettext() function.
+  ```c
+  printf(Q_("%d commit", "%d commits", number_of_commits));
+  ```
 
-   - N_()
+  This is just a wrapper for the ngettext() function.
 
-    A no-op pass-through macro for marking strings inside static
-    initializations, e.g.:
+- N\_()
 
-        static const char *reset_type_names[] = {
-            N_("mixed"), N_("soft"), N_("hard"), N_("merge"), N_("keep"), NULL
-        };
+  A no-op pass-through macro for marking strings inside static
+  initializations, e.g.:
 
-    And then, later:
+  ```c
+  static const char *reset_type_names[] = {
+      N_("mixed"), N_("soft"), N_("hard"), N_("merge"), N_("keep"), NULL
+  };
+  ```
 
-        die(_("%s reset is not allowed in a bare repository"),
-               _(reset_type_names[reset_type]));
+  And then, later:
 
-    Here _() couldn't have statically determined what the translation
-    string will be, but since it was already marked for translation
-    with N_() the look-up in the message catalog will succeed.
+  ```c
+  die(_("%s reset is not allowed in a bare repository"),
+        _(reset_type_names[reset_type]));
+  ```
 
-Shell:
-
- - The Git gettext shell interface is just a wrapper for
-   gettext.sh. Import it right after git-sh-setup like this:
-
-       . git-sh-setup
-       . git-sh-i18n
-
-   And then use the gettext or eval_gettext functions:
-
-       # For constant interface messages:
-       gettext "A message for the user"; echo
-
-       # To interpolate variables:
-       details="oh noes"
-       eval_gettext "An error occurred: \$details"; echo
-
-   In addition we have wrappers for messages that end with a trailing
-   newline. I.e. you could write the above as:
-
-       # For constant interface messages:
-       gettextln "A message for the user"
-
-       # To interpolate variables:
-       details="oh noes"
-       eval_gettextln "An error occurred: \$details"
-
-   More documentation about the interface is available in the GNU info
-   page: `info '(gettext)sh'`. Looking at git-am.sh (the first shell
-   command to be translated) for examples is also useful:
-
-       git log --reverse -p --grep=i18n git-am.sh
-
-Perl:
-
- - The Git::I18N module provides a limited subset of the
-   Locale::Messages functionality, e.g.:
-
-       use Git::I18N;
-       print __("Welcome to Git!\n");
-       printf __("The following error occurred: %s\n"), $error;
-
-   Run `perldoc perl/Git/I18N.pm` for more info.
+  Here `_()` couldn't have statically determined what the translation
+  string will be, but since it was already marked for translation
+  with `N_()` the look-up in the message catalog will succeed.
 
 
-Testing marked strings
-----------------------
+### Shell
 
-Git's tests are run under LANG=C LC_ALL=C. So the tests do not need be
+The Git gettext shell interface is just a wrapper for
+gettext.sh. Import it right after git-sh-setup like this:
+
+```shell
+. git-sh-setup
+. git-sh-i18n
+```
+
+And then use the `gettext` or `eval_gettext` functions:
+
+```shell
+# For constant interface messages:
+gettext "A message for the user"; echo
+
+# To interpolate variables:
+details="oh noes"
+eval_gettext "An error occurred: \$details"; echo
+```
+
+In addition we have wrappers for messages that end with a trailing
+newline. I.e. you could write the above as:
+
+```shell
+# For constant interface messages:
+gettextln "A message for the user"
+
+# To interpolate variables:
+details="oh noes"
+eval_gettextln "An error occurred: \$details"
+```
+
+More documentation about the interface is available in the GNU info
+page: `info '(gettext)sh'`. Looking at git-am.sh (the first shell
+command to be translated) for examples is also useful:
+
+```shell
+git log --reverse -p --grep=i18n git-am.sh
+```
+
+
+### Perl
+
+The Git::I18N module provides a limited subset of the
+Locale::Messages functionality, e.g.:
+
+```perl
+use Git::I18N;
+print __("Welcome to Git!\n");
+printf __("The following error occurred: %s\n"), $error;
+```
+
+Run `perldoc perl/Git/I18N.pm` for more info.
+
+
+## Testing marked strings
+
+Git's tests are run under `LANG=C LC_ALL=C`. So the tests do not need be
 changed to account for translations as they're added.
 
 
-PO helper
----------
+## AI-assisted translation and review
 
-To make the maintenance of XX.po easier, the l10n coordinator and l10n
-team leaders can use a helper program named "git-po-helper". It is a
-wrapper to gettext suite, specifically written for the purpose of Git
-l10n workflow.
+[po/AGENTS.md](AGENTS.md) describes optional workflows for AI coding assistants
+that help with Git localization: updating templates and PO files, translating
+`po/XX.po`, and reviewing translations. Those workflows often use git-po-helper
+together with the gettext tools; see the PO helper section below for what the
+program does and how to build or install it. AI assistants are optional; treat
+their output as a draft and have it reviewed by contributors who know Git and
+the target language well.
 
-To build and install the helper program from source, see
-[git-po-helper/README][].
-
-Usage for git-po-helper:
-
-  - To start a new language translation:
-
-        git-po-helper init XX.po
-
-  - To update your XX.po file:
-
-        git-po-helper update XX.po
-
-  - To check commit log and syntax of XX.po:
-
-        git-po-helper check-po XX.po
-        git-po-helper check-commits
-
-Run "git-po-helper" without arguments to show usage.
+When you prompt a coding assistant, mention that file explicitly, for example:
+"Translate po/XX.po with reference to po/AGENTS.md" (replace XX with your
+language code).
 
 
-Conventions
------------
+## PO helper
+
+`git-po-helper` is a helper for Git l10n coordinators and contributors. It
+automates checks that contributions follow project conventions (PO syntax,
+commit messages, which paths may change, and related rules) and can work with
+AI coding agents for tasks such as translating new entries, and reviewing
+translations.
+
+Build and install instructions are in [git-po-helper/README][].
+
+
+## Conventions
 
 There are some conventions that l10n contributors must follow:
 
-1. The subject of each l10n commit should be prefixed with "l10n: ".
-2. Do not use non-ASCII characters in the subject of a commit.
-3. The length of commit subject (first line of the commit log) should
-   be less than 50 characters, and the length of other lines of the
-   commit log should be no more than 72 characters.
-4. Add "Signed-off-by" trailer to your commit log, like other commits
-   in Git. You can automatically add the trailer by committing with
-   the following command:
+- The subject of each l10n commit should be prefixed with "l10n: ".
 
-        git commit -s
+- Do not use non-ASCII characters in the subject of a commit.
 
-5. Check syntax with "msgfmt" or the following command before creating
-   your commit:
+- The length of commit subject (first line of the commit log) should
+  be no more than 50 characters, and the length of other lines of the
+  commit log should be no more than 72 characters.
 
-        git-po-helper check-po <XX.po>
+- Add "Signed-off-by" trailer to your commit log, like other commits
+  in Git. You can automatically add the trailer by committing with
+  the following command:
 
-6. Squash trivial commits to make history clear.
-7. DO NOT edit files outside "po/" directory.
-8. Other subsystems ("git-gui", "gitk", and Git itself) have their
-   own workflow. See [Documentation/SubmittingPatches][] for
-   instructions on how to contribute patches to these subsystems.
+  ```shell
+  git commit -s
+  ```
+
+- Check syntax with "msgfmt" or the following command before creating
+  your commit:
+
+  ```shell
+  git-po-helper check-po <XX.po>
+  ```
+
+- Squash trivial commits to make history clear.
+
+- DO NOT edit files outside "po/" directory.
+
+- Other subsystems ("git-gui", "gitk", and Git itself) have their
+  own workflow. See [Documentation/SubmittingPatches][] for
+  instructions on how to contribute patches to these subsystems.
+
 
 To contribute for a new l10n language, contributor should follow
 additional conventions:
 
-1. Initialize proper filename of the "XX.po" file conforming to
-   iso-639 and iso-3166.
-2. Must complete a minimal translation based on the "po-core/core.pot"
-   template. Using the following command to initialize the minimal
-   "po-core/XX.po" file:
+- Initialize proper filename of the "XX.po" file conforming to
+  iso-639 and iso-3166.
 
-        git-po-helper init --core <your-language>
+- Must complete a minimal translation based on the "Core
+  translation". See that section above.
 
-3. Add a new entry in the "po/TEAMS" file with proper format, and check
-   the syntax of "po/TEAMS" by runnning the following command:
+- Add a new entry in the "po/TEAMS" file with proper format, and check
+  the syntax of "po/TEAMS" by running the following command:
 
-        git-po-helper team --check
+  ```shell
+  git-po-helper team --check
+  ```
 
 
 [git-po-helper/README]: https://github.com/git-l10n/git-po-helper#readme

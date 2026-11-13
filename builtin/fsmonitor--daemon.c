@@ -1,19 +1,31 @@
+#define USE_THE_REPOSITORY_VARIABLE
+#define DISABLE_SIGN_COMPARE_WARNINGS
+
 #include "builtin.h"
+#include "abspath.h"
 #include "config.h"
+#include "dir.h"
+#include "environment.h"
+#include "gettext.h"
 #include "parse-options.h"
-#include "fsmonitor.h"
+#include "fsmonitor-ll.h"
 #include "fsmonitor-ipc.h"
+#include "fsmonitor-settings.h"
+#include "compat/fsmonitor/fsm-health.h"
 #include "compat/fsmonitor/fsm-listen.h"
 #include "fsmonitor--daemon.h"
+
 #include "simple-ipc.h"
-#include "khash.h"
-#include "pkt-line.h"
+#include "strmap.h"
+#include "run-command.h"
+#include "trace.h"
+#include "trace2.h"
 
 static const char * const builtin_fsmonitor__daemon_usage[] = {
 	N_("git fsmonitor--daemon start [<options>]"),
 	N_("git fsmonitor--daemon run [<options>]"),
-	N_("git fsmonitor--daemon stop"),
-	N_("git fsmonitor--daemon status"),
+	"git fsmonitor--daemon stop",
+	"git fsmonitor--daemon status",
 	NULL
 };
 
@@ -27,10 +39,14 @@ static int fsmonitor__ipc_threads = 8;
 #define FSMONITOR__START_TIMEOUT "fsmonitor.starttimeout"
 static int fsmonitor__start_timeout_sec = 60;
 
-static int fsmonitor_config(const char *var, const char *value, void *cb)
+#define FSMONITOR__ANNOUNCE_STARTUP "fsmonitor.announcestartup"
+static int fsmonitor__announce_startup = 0;
+
+static int fsmonitor_config(const char *var, const char *value,
+			    const struct config_context *ctx, void *cb)
 {
 	if (!strcmp(var, FSMONITOR__IPC_THREADS)) {
-		int i = git_config_int(var, value);
+		int i = git_config_int(var, value, ctx->kvi);
 		if (i < 1)
 			return error(_("value of '%s' out of range: %d"),
 				     FSMONITOR__IPC_THREADS, i);
@@ -39,7 +55,7 @@ static int fsmonitor_config(const char *var, const char *value, void *cb)
 	}
 
 	if (!strcmp(var, FSMONITOR__START_TIMEOUT)) {
-		int i = git_config_int(var, value);
+		int i = git_config_int(var, value, ctx->kvi);
 		if (i < 0)
 			return error(_("value of '%s' out of range: %d"),
 				     FSMONITOR__START_TIMEOUT, i);
@@ -47,7 +63,17 @@ static int fsmonitor_config(const char *var, const char *value, void *cb)
 		return 0;
 	}
 
-	return git_default_config(var, value, cb);
+	if (!strcmp(var, FSMONITOR__ANNOUNCE_STARTUP)) {
+		int is_bool;
+		int i = git_config_bool_or_int(var, value, ctx->kvi, &is_bool);
+		if (i < 0)
+			return error(_("value of '%s' not bool or int: %d"),
+				     var, i);
+		fsmonitor__announce_startup = i;
+		return 0;
+	}
+
+	return git_default_config(var, value, ctx, cb);
 }
 
 /*
@@ -60,6 +86,8 @@ static int do_as_client__send_stop(void)
 {
 	struct strbuf answer = STRBUF_INIT;
 	int ret;
+	int max_wait_ms = 30000;
+	int elapsed_ms = 0;
 
 	ret = fsmonitor_ipc__send_command("quit", &answer);
 
@@ -70,8 +98,16 @@ static int do_as_client__send_stop(void)
 		return ret;
 
 	trace2_region_enter("fsm_client", "polling-for-daemon-exit", NULL);
-	while (fsmonitor_ipc__get_state() == IPC_STATE__LISTENING)
+	while (fsmonitor_ipc__get_state() == IPC_STATE__LISTENING) {
+		if (elapsed_ms >= max_wait_ms) {
+			trace2_region_leave("fsm_client",
+					    "polling-for-daemon-exit", NULL);
+			return error(_("daemon did not stop within %d seconds"),
+				     max_wait_ms / 1000);
+		}
 		sleep_millisec(50);
+		elapsed_ms += 50;
+	}
 	trace2_region_leave("fsm_client", "polling-for-daemon-exit", NULL);
 
 	return 0;
@@ -96,19 +132,20 @@ static int do_as_client__status(void)
 
 enum fsmonitor_cookie_item_result {
 	FCIR_ERROR = -1, /* could not create cookie file ? */
-	FCIR_INIT = 0,
+	FCIR_INIT,
 	FCIR_SEEN,
 	FCIR_ABORT,
 };
 
 struct fsmonitor_cookie_item {
 	struct hashmap_entry entry;
-	const char *name;
+	char *name;
 	enum fsmonitor_cookie_item_result result;
 };
 
-static int cookies_cmp(const void *data, const struct hashmap_entry *he1,
-		     const struct hashmap_entry *he2, const void *keydata)
+static int cookies_cmp(const void *data UNUSED,
+		       const struct hashmap_entry *he1,
+		       const struct hashmap_entry *he2, const void *keydata)
 {
 	const struct fsmonitor_cookie_item *a =
 		container_of(he1, const struct fsmonitor_cookie_item, entry);
@@ -153,31 +190,55 @@ static enum fsmonitor_cookie_item_result with_lock__wait_for_cookie(
 	 * that the listener thread has seen it.
 	 */
 	fd = open(cookie_pathname.buf, O_WRONLY | O_CREAT | O_EXCL, 0600);
-	if (fd >= 0) {
-		close(fd);
-		unlink(cookie_pathname.buf);
-
-		/*
-		 * NEEDSWORK: This is an infinite wait (well, unless another
-		 * thread sends us an abort).  I'd like to change this to
-		 * use `pthread_cond_timedwait()` and return an error/timeout
-		 * and let the caller do the trivial response thing.
-		 */
-		while (cookie->result == FCIR_INIT)
-			pthread_cond_wait(&state->cookies_cond,
-					  &state->main_lock);
-	} else {
+	if (fd < 0) {
 		error_errno(_("could not create fsmonitor cookie '%s'"),
 			    cookie->name);
 
 		cookie->result = FCIR_ERROR;
+		goto done;
 	}
 
+	/*
+	 * Technically, close() and unlink() can fail, but we don't
+	 * care here.  We only created the file to trigger a watch
+	 * event from the FS to know that when we're up to date.
+	 */
+	close(fd);
+	unlink(cookie_pathname.buf);
+
+	/*
+	 * Wait for the listener thread to observe the cookie file.
+	 * Time out after a short interval so that the client
+	 * does not hang forever if the filesystem does not deliver
+	 * events (e.g., on certain container/overlay filesystems
+	 * where inotify watches succeed but events never arrive).
+	 */
+	{
+		struct timeval now;
+		struct timespec ts;
+		int err = 0;
+
+		gettimeofday(&now, NULL);
+		ts.tv_sec = now.tv_sec + 1;
+		ts.tv_nsec = now.tv_usec * 1000;
+
+		while (cookie->result == FCIR_INIT && !err)
+			err = pthread_cond_timedwait(&state->cookies_cond,
+						     &state->main_lock,
+						     &ts);
+		if (err == ETIMEDOUT && cookie->result == FCIR_INIT) {
+			trace_printf_key(&trace_fsmonitor,
+					 "cookie_wait timed out");
+			cookie->result = FCIR_ERROR;
+		}
+	}
+
+done:
 	hashmap_remove(&state->cookies, &cookie->entry, NULL);
 
 	result = cookie->result;
 
-	free((char*)cookie->name);
+	free(cookie->name);
 	free(cookie);
 	strbuf_release(&cookie_pathname);
 
@@ -400,22 +461,21 @@ struct fsmonitor_batch *fsmonitor_batch__new(void)
 	return batch;
 }
 
-struct fsmonitor_batch *fsmonitor_batch__pop(struct fsmonitor_batch *batch)
+void fsmonitor_batch__free_list(struct fsmonitor_batch *batch)
 {
-	struct fsmonitor_batch *next;
+	while (batch) {
+		struct fsmonitor_batch *next = batch->next;
 
-	if (!batch)
-		return NULL;
+		/*
+		 * The actual strings within the array of this batch
+		 * are interned, so we don't own them.  We only own
+		 * the array.
+		 */
+		free(batch->interned_paths);
+		free(batch);
 
-	next = batch->next;
-
-	/*
-	 * The actual strings within the array are interned, so we don't
-	 * own them.
-	 */
-	free(batch->interned_paths);
-
-	return next;
+		batch = next;
+	}
 }
 
 void fsmonitor_batch__add_path(struct fsmonitor_batch *batch,
@@ -512,24 +572,8 @@ truncate_past_here:
 	return remainder;
 }
 
-static void free_remainder(struct fsmonitor_batch *remainder)
-{
-	struct fsmonitor_batch *p;
-
-	if (!remainder)
-		return;
-
-	for (p = remainder; p; p = fsmonitor_batch__pop(p)) {
-		trace_printf_key(&trace_fsmonitor,
-				 "Truncate: kill (%"PRIu64",%"PRIu64")",
-				 p->batch_seq_nr, (uint64_t)p->pinned_time);
-	}
-}
-
 static void fsmonitor_free_token_data(struct fsmonitor_token_data *token)
 {
-	struct fsmonitor_batch *p;
-
 	if (!token)
 		return;
 
@@ -537,8 +581,7 @@ static void fsmonitor_free_token_data(struct fsmonitor_token_data *token)
 
 	strbuf_release(&token->token_id);
 
-	for (p = token->batch_head; p; p = fsmonitor_batch__pop(p))
-		;
+	fsmonitor_batch__free_list(token->batch_head);
 
 	free(token);
 }
@@ -555,7 +598,7 @@ static void fsmonitor_free_token_data(struct fsmonitor_token_data *token)
  * [2] Some of those lost events may have been for cookie files.  We
  *     should assume the worst and abort them rather letting them starve.
  *
- * If there are no concurrent threads readering the current token data
+ * If there are no concurrent threads reading the current token data
  * series, we can free it now.  Otherwise, let the last reader free
  * it.
  *
@@ -631,8 +674,6 @@ static int fsmonitor_parse_client_token(const char *buf_token,
 	return 0;
 }
 
-KHASH_INIT(str, const char *, int, 0, kh_str_hash_func, kh_str_hash_equal);
-
 static int do_handle_client(struct fsmonitor_daemon_state *state,
 			    const char *command,
 			    ipc_server_reply_cb *reply,
@@ -649,8 +690,7 @@ static int do_handle_client(struct fsmonitor_daemon_state *state,
 	const struct fsmonitor_batch *batch;
 	struct fsmonitor_batch *remainder = NULL;
 	intmax_t count = 0, duplicates = 0;
-	kh_str_t *shown;
-	int hash_ret;
+	struct strset shown = STRSET_INIT;
 	int do_trivial = 0;
 	int do_flush = 0;
 	int do_cookie = 0;
@@ -700,6 +740,7 @@ static int do_handle_client(struct fsmonitor_daemon_state *state,
 				  "fsmonitor: unsupported V1 protocol '%s'"),
 				 command);
 		do_trivial = 1;
+		do_cookie = 1;
 
 	} else {
 		/* We have "builtin:*" */
@@ -709,6 +750,7 @@ static int do_handle_client(struct fsmonitor_daemon_state *state,
 					 "fsmonitor: invalid V2 protocol token '%s'",
 					 command);
 			do_trivial = 1;
+			do_cookie = 1;
 
 		} else {
 			/*
@@ -813,9 +855,7 @@ static int do_handle_client(struct fsmonitor_daemon_state *state,
 		trace2_data_intmax("fsmonitor", the_repository,
 				   "response/trivial", 1);
 
-		strbuf_release(&response_token);
-		strbuf_release(&requested_token_id);
-		return 0;
+		goto cleanup;
 	}
 
 	/*
@@ -839,14 +879,14 @@ static int do_handle_client(struct fsmonitor_daemon_state *state,
 	 * so walk the batch list backwards from the current head back
 	 * to the batch (sequence number) they named.
 	 *
-	 * We use khash to de-dup the list of pathnames.
+	 * We use a strset to de-dup the list of pathnames.
 	 *
 	 * NEEDSWORK: each batch contains a list of interned strings,
 	 * so we only need to do pointer comparisons here to build the
 	 * hash table.  Currently, we're still comparing the string
 	 * values.
 	 */
-	shown = kh_init_str();
+	strset_init_with_options(&shown, NULL, 0);
 	for (batch = batch_head;
 	     batch && batch->batch_seq_nr > requested_oldest_seq_nr;
 	     batch = batch->next) {
@@ -856,11 +896,9 @@ static int do_handle_client(struct fsmonitor_daemon_state *state,
 			const char *s = batch->interned_paths[k];
 			size_t s_len;
 
-			if (kh_get_str(shown, s) != kh_end(shown))
+			if (!strset_add(&shown, s))
 				duplicates++;
 			else {
-				kh_put_str(shown, s, &hash_ret);
-
 				trace_printf_key(&trace_fsmonitor,
 						 "send[%"PRIuMAX"]: %s",
 						 count, s);
@@ -887,8 +925,6 @@ static int do_handle_client(struct fsmonitor_daemon_state *state,
 		total_response_len += payload.len;
 	}
 
-	kh_release_str(shown);
-
 	pthread_mutex_lock(&state->main_lock);
 
 	if (token_data->client_ref_count > 0)
@@ -906,24 +942,33 @@ static int do_handle_client(struct fsmonitor_daemon_state *state,
 			fsmonitor_free_token_data(token_data);
 		} else if (batch) {
 			/*
-			 * This batch is the first item in the list
-			 * that is older than the requested sequence
-			 * number and might be considered to be
-			 * obsolete.  See if we can truncate the list
-			 * and save some memory.
+			 * We are holding the lock and are the only
+			 * reader of the ref-counted portion of the
+			 * list, so we get the honor of seeing if the
+			 * list can be truncated to save memory.
+			 *
+			 * The main loop did not walk to the end of the
+			 * list, so this batch is the first item in the
+			 * batch-list that is older than the requested
+			 * end-point sequence number.  See if the tail
+			 * end of the list is obsolete.
 			 */
-			remainder = with_lock__truncate_old_batches(state, batch);
+			remainder = with_lock__truncate_old_batches(state,
+								    batch);
 		}
 	}
 
 	pthread_mutex_unlock(&state->main_lock);
 
-	free_remainder(remainder);
+	if (remainder)
+		fsmonitor_batch__free_list(remainder);
 
 	trace2_data_intmax("fsmonitor", the_repository, "response/length", total_response_len);
 	trace2_data_intmax("fsmonitor", the_repository, "response/count/files", count);
 	trace2_data_intmax("fsmonitor", the_repository, "response/count/duplicates", duplicates);
 
+cleanup:
+	strset_clear(&shown);
 	strbuf_release(&response_token);
 	strbuf_release(&requested_token_id);
 	strbuf_release(&payload);
@@ -1094,7 +1139,7 @@ void fsmonitor_publish(struct fsmonitor_daemon_state *state,
 			 * `fsmonitor_new_token_data()` about why we
 			 * don't need to accumulate these paths.
 			 */
-			fsmonitor_batch__pop(batch);
+			fsmonitor_batch__free_list(batch);
 		} else if (head->nr + batch->nr > MY_COMBINE_LIMIT) {
 			/*
 			 * The head batch in the list has never been
@@ -1108,11 +1153,11 @@ void fsmonitor_publish(struct fsmonitor_daemon_state *state,
 			state->current_token_data->batch_head = batch;
 		} else {
 			/*
-			 * We are free to append the paths in the given
+			 * We are free to add the paths in the given
 			 * batch onto the end of the current head batch.
 			 */
 			fsmonitor_batch__combine(head, batch);
-			fsmonitor_batch__pop(batch);
+			fsmonitor_batch__free_list(batch);
 		}
 	}
 
@@ -1120,6 +1165,18 @@ void fsmonitor_publish(struct fsmonitor_daemon_state *state,
 		with_lock__mark_cookies_seen(state, cookie_names);
 
 	pthread_mutex_unlock(&state->main_lock);
+}
+
+static void *fsm_health__thread_proc(void *_state)
+{
+	struct fsmonitor_daemon_state *state = _state;
+
+	trace2_thread_start("fsm-health");
+
+	fsm_health__loop(state);
+
+	trace2_thread_exit();
+	return NULL;
 }
 
 static void *fsm_listen__thread_proc(void *_state)
@@ -1160,33 +1217,54 @@ static int fsmonitor_run_daemon_1(struct fsmonitor_daemon_state *state)
 		 */
 		.uds_disallow_chdir = 0
 	};
+	int health_started = 0;
+	int listener_started = 0;
+	int err = 0;
 
 	/*
 	 * Start the IPC thread pool before the we've started the file
 	 * system event listener thread so that we have the IPC handle
 	 * before we need it.
 	 */
-	if (ipc_server_run_async(&state->ipc_server_data,
-				 fsmonitor_ipc__get_path(), &ipc_opts,
-				 handle_client, state))
-		return error(_("could not start IPC thread pool"));
+	if (ipc_server_init_async(&state->ipc_server_data,
+				  state->path_ipc.buf, &ipc_opts,
+				  handle_client, state))
+		return error_errno(
+			_("could not start IPC thread pool on '%s'"),
+			state->path_ipc.buf);
 
 	/*
 	 * Start the fsmonitor listener thread to collect filesystem
 	 * events.
 	 */
 	if (pthread_create(&state->listener_thread, NULL,
-			   fsm_listen__thread_proc, state) < 0) {
+			   fsm_listen__thread_proc, state)) {
 		ipc_server_stop_async(state->ipc_server_data);
-		ipc_server_await(state->ipc_server_data);
-
-		return error(_("could not start fsmonitor listener thread"));
+		err = error(_("could not start fsmonitor listener thread"));
+		goto cleanup;
 	}
+	listener_started = 1;
+
+	/*
+	 * Start the health thread to watch over our process.
+	 */
+	if (pthread_create(&state->health_thread, NULL,
+			   fsm_health__thread_proc, state)) {
+		ipc_server_stop_async(state->ipc_server_data);
+		err = error(_("could not start fsmonitor health thread"));
+		goto cleanup;
+	}
+	health_started = 1;
 
 	/*
 	 * The daemon is now fully functional in background threads.
+	 * Our primary thread should now just wait while the threads
+	 * do all the work.
+	 */
+cleanup:
+	/*
 	 * Wait for the IPC thread pool to shutdown (whether by client
-	 * request or from filesystem activity).
+	 * request, from filesystem activity, or an error).
 	 */
 	ipc_server_await(state->ipc_server_data);
 
@@ -1195,15 +1273,29 @@ static int fsmonitor_run_daemon_1(struct fsmonitor_daemon_state *state)
 	 * event from the IPC thread pool, but it doesn't hurt to tell
 	 * it again.  And wait for it to shutdown.
 	 */
-	fsm_listen__stop_async(state);
-	pthread_join(state->listener_thread, NULL);
+	if (listener_started) {
+		fsm_listen__stop_async(state);
+		pthread_join(state->listener_thread, NULL);
+	}
 
-	return state->error_code;
+	if (health_started) {
+		fsm_health__stop_async(state);
+		pthread_join(state->health_thread, NULL);
+	}
+
+	if (err)
+		return err;
+	if (state->listen_error_code)
+		return state->listen_error_code;
+	if (state->health_error_code)
+		return state->health_error_code;
+	return 0;
 }
 
 static int fsmonitor_run_daemon(void)
 {
 	struct fsmonitor_daemon_state state;
+	const char *home;
 	int err;
 
 	memset(&state, 0, sizeof(state));
@@ -1211,13 +1303,20 @@ static int fsmonitor_run_daemon(void)
 	hashmap_init(&state.cookies, cookies_cmp, NULL, 0);
 	pthread_mutex_init(&state.main_lock, NULL);
 	pthread_cond_init(&state.cookies_cond, NULL);
-	state.error_code = 0;
+	state.listen_error_code = 0;
+	state.health_error_code = 0;
 	state.current_token_data = fsmonitor_new_token_data();
 
 	/* Prepare to (recursively) watch the <worktree-root> directory. */
 	strbuf_init(&state.path_worktree_watch, 0);
-	strbuf_addstr(&state.path_worktree_watch, absolute_path(get_git_work_tree()));
+	strbuf_addstr(&state.path_worktree_watch,
+		      absolute_path(repo_get_work_tree(the_repository)));
 	state.nr_paths_watching = 1;
+
+	strbuf_init(&state.alias.alias, 0);
+	strbuf_init(&state.alias.points_to, 0);
+	if ((err = fsmonitor__get_alias(state.path_worktree_watch.buf, &state.alias)))
+		goto done;
 
 	/*
 	 * We create and delete cookie files somewhere inside the .git
@@ -1231,7 +1330,9 @@ static int fsmonitor_run_daemon(void)
 	strbuf_addstr(&state.path_gitdir_watch, "/.git");
 	if (!is_directory(state.path_gitdir_watch.buf)) {
 		strbuf_reset(&state.path_gitdir_watch);
-		strbuf_addstr(&state.path_gitdir_watch, absolute_path(get_git_dir()));
+		strbuf_addstr(&state.path_gitdir_watch,
+			      absolute_path(repo_get_git_dir(the_repository)));
+		strbuf_strip_suffix(&state.path_gitdir_watch, "/.");
 		state.nr_paths_watching = 2;
 	}
 
@@ -1274,6 +1375,16 @@ static int fsmonitor_run_daemon(void)
 	strbuf_addch(&state.path_cookie_prefix, '/');
 
 	/*
+	 * We create a named-pipe or unix domain socket inside of the
+	 * ".git" directory.  (Well, on Windows, we base our named
+	 * pipe in the NPFS on the absolute path of the git
+	 * directory.)
+	 */
+	strbuf_init(&state.path_ipc, 0);
+	strbuf_addstr(&state.path_ipc,
+		absolute_path(fsmonitor_ipc__get_path(the_repository)));
+
+	/*
 	 * Confirm that we can create platform-specific resources for the
 	 * filesystem listener before we bother starting all the threads.
 	 */
@@ -1282,27 +1393,60 @@ static int fsmonitor_run_daemon(void)
 		goto done;
 	}
 
+	if (fsm_health__ctor(&state)) {
+		err = error(_("could not initialize health thread"));
+		goto done;
+	}
+
+	/*
+	 * CD out of the worktree root directory.
+	 *
+	 * The common Git startup mechanism causes our CWD to be the
+	 * root of the worktree.  On Windows, this causes our process
+	 * to hold a locked handle on the CWD.  This prevents the
+	 * worktree from being moved or deleted while the daemon is
+	 * running.
+	 *
+	 * We assume that our FS and IPC listener threads have either
+	 * opened all of the handles that they need or will do
+	 * everything using absolute paths.
+	 */
+	home = getenv("HOME");
+	if (home && *home && chdir(home))
+		die_errno(_("could not cd home '%s'"), home);
+
 	err = fsmonitor_run_daemon_1(&state);
 
 done:
+	fsmonitor_free_token_data(state.current_token_data);
+	state.current_token_data = NULL;
 	pthread_cond_destroy(&state.cookies_cond);
 	pthread_mutex_destroy(&state.main_lock);
+	{
+		struct hashmap_iter iter;
+		struct fsmonitor_cookie_item *cookie;
+
+		hashmap_for_each_entry(&state.cookies, &iter, cookie, entry)
+			free(cookie->name);
+		hashmap_clear_and_free(&state.cookies,
+				       struct fsmonitor_cookie_item, entry);
+	}
 	fsm_listen__dtor(&state);
+	fsm_health__dtor(&state);
 
 	ipc_server_free(state.ipc_server_data);
 
 	strbuf_release(&state.path_worktree_watch);
 	strbuf_release(&state.path_gitdir_watch);
 	strbuf_release(&state.path_cookie_prefix);
-
-	/*
-	 * NEEDSWORK: Consider "rm -rf <gitdir>/<fsmonitor-dir>"
-	 */
+	strbuf_release(&state.path_ipc);
+	strbuf_release(&state.alias.alias);
+	strbuf_release(&state.alias.points_to);
 
 	return err;
 }
 
-static int try_to_run_foreground_daemon(int free_console)
+static int try_to_run_foreground_daemon(int detach_console)
 {
 	/*
 	 * Technically, we don't need to probe for an existing daemon
@@ -1313,175 +1457,63 @@ static int try_to_run_foreground_daemon(int free_console)
 	 * common error case.
 	 */
 	if (fsmonitor_ipc__get_state() == IPC_STATE__LISTENING)
-		die("fsmonitor--daemon is already running '%s'",
+		die(_("fsmonitor--daemon is already running '%s'"),
 		    the_repository->worktree);
 
-	printf(_("running fsmonitor-daemon in '%s'\n"),
-	       the_repository->worktree);
-	fflush(stdout);
+	if (fsmonitor__announce_startup) {
+		fprintf(stderr, _("running fsmonitor-daemon in '%s'\n"),
+			the_repository->worktree);
+		fflush(stderr);
+	}
 
+	if (detach_console) {
 #ifdef GIT_WINDOWS_NATIVE
-	if (free_console)
 		FreeConsole();
+#else
+		/*
+		 * Create a new session so that the daemon is detached
+		 * from the parent's process group.  This prevents
+		 * shells with job control (e.g. bash with "set -m")
+		 * from waiting on the daemon when they wait for a
+		 * foreground command that implicitly spawned it.
+		 */
+		if (setsid() == -1)
+			warning_errno(_("setsid failed"));
 #endif
+	}
 
 	return !!fsmonitor_run_daemon();
 }
 
-#ifdef GIT_WINDOWS_NATIVE
-/*
- * Create a background process to run the daemon.  It should be completely
- * disassociated from the terminal.
- *
- * Conceptually like `daemonize()` but different because Windows does not
- * have `fork(2)`.  Spawn a normal Windows child process but without the
- * limitations of `start_command()` and `finish_command()`.
- *
- * The child process execs the "git fsmonitor--daemon run" command.
- *
- * The current process returns so that the caller can wait for the child
- * to startup before exiting.
- */
-static int spawn_fsmonitor(pid_t *pid)
+static start_bg_wait_cb bg_wait_cb;
+
+static int bg_wait_cb(const struct child_process *cp UNUSED,
+		      void *cb_data UNUSED)
 {
-	char git_exe[MAX_PATH];
-	struct strvec args = STRVEC_INIT;
-	int in, out;
+	enum ipc_active_state s = fsmonitor_ipc__get_state();
 
-	GetModuleFileNameA(NULL, git_exe, MAX_PATH);
+	switch (s) {
+	case IPC_STATE__LISTENING:
+		/* child is "ready" */
+		return 0;
 
-	in = open("/dev/null", O_RDONLY);
-	out = open("/dev/null", O_WRONLY);
-
-	strvec_push(&args, git_exe);
-	strvec_push(&args, "fsmonitor--daemon");
-	strvec_push(&args, "run");
-	strvec_push(&args, "--free-console");
-	strvec_pushf(&args, "--ipc-threads=%d", fsmonitor__ipc_threads);
-
-	*pid = mingw_spawnvpe(args.v[0], args.v, NULL, NULL, in, out, out);
-	close(in);
-	close(out);
-
-	strvec_clear(&args);
-
-	if (*pid < 0)
-		return error(_("could not spawn fsmonitor--daemon in the background"));
-
-	return 0;
-}
-#else
-/*
- * Create a background process to run the daemon.  It should be completely
- * disassociated from the terminal.
- *
- * This is adapted from `daemonize()`.  Use `fork()` to directly
- * create and run the daemon in the child process.
- *
- * The fork-child can just call the run code; it does not need to exec
- * it.
- *
- * The fork-parent returns the child PID so that we can wait for the
- * child to startup before exiting.
- */
-static int spawn_fsmonitor(pid_t *pid)
-{
-	*pid = fork();
-
-	switch (*pid) {
-	case 0:
-		if (setsid() == -1)
-			error_errno(_("setsid failed"));
-		close(0);
-		close(1);
-		close(2);
-		sanitize_stdfds();
-
-		return !!fsmonitor_run_daemon();
-
-	case -1:
-		return error_errno(_("could not spawn fsmonitor--daemon in the background"));
+	case IPC_STATE__NOT_LISTENING:
+	case IPC_STATE__PATH_NOT_FOUND:
+		/* give child more time */
+		return 1;
 
 	default:
-		return 0;
-	}
-}
-#endif
-
-/*
- * This is adapted from `wait_or_whine()`.  Watch the child process and
- * let it get started and begin listening for requests on the socket
- * before reporting our success.
- */
-static int wait_for_startup(pid_t pid_child)
-{
-	int status;
-	pid_t pid_seen;
-	enum ipc_active_state s;
-	time_t time_limit, now;
-
-	time(&time_limit);
-	time_limit += fsmonitor__start_timeout_sec;
-
-	for (;;) {
-		pid_seen = waitpid(pid_child, &status, WNOHANG);
-
-		if (pid_seen == -1)
-			return error_errno(_("waitpid failed"));
-		else if (pid_seen == 0) {
-			/*
-			 * The child is still running (this should be
-			 * the normal case).  Try to connect to it on
-			 * the socket and see if it is ready for
-			 * business.
-			 *
-			 * If there is another daemon already running,
-			 * our child will fail to start (possibly
-			 * after a timeout on the lock), but we don't
-			 * care (who responds) if the socket is live.
-			 */
-			s = fsmonitor_ipc__get_state();
-			if (s == IPC_STATE__LISTENING)
-				return 0;
-
-			time(&now);
-			if (now > time_limit)
-				return error(_("fsmonitor--daemon not online yet"));
-		} else if (pid_seen == pid_child) {
-			/*
-			 * The new child daemon process shutdown while
-			 * it was starting up, so it is not listening
-			 * on the socket.
-			 *
-			 * Try to ping the socket in the odd chance
-			 * that another daemon started (or was already
-			 * running) while our child was starting.
-			 *
-			 * Again, we don't care who services the socket.
-			 */
-			s = fsmonitor_ipc__get_state();
-			if (s == IPC_STATE__LISTENING)
-				return 0;
-
-			/*
-			 * We don't care about the WEXITSTATUS() nor
-			 * any of the WIF*(status) values because
-			 * `cmd_fsmonitor__daemon()` does the `!!result`
-			 * trick on all function return values.
-			 *
-			 * So it is sufficient to just report the
-			 * early shutdown as an error.
-			 */
-			return error(_("fsmonitor--daemon failed to start"));
-		} else
-			return error(_("waitpid is confused"));
+	case IPC_STATE__INVALID_PATH:
+	case IPC_STATE__OTHER_ERROR:
+		/* all the time in world won't help */
+		return -1;
 	}
 }
 
 static int try_to_start_background_daemon(void)
 {
-	pid_t pid_child;
-	int ret;
+	struct child_process cp = CHILD_PROCESS_INIT;
+	enum start_bg_result sbgr;
 
 	/*
 	 * Before we try to create a background daemon process, see
@@ -1492,82 +1524,102 @@ static int try_to_start_background_daemon(void)
 	 * immediately exited).
 	 */
 	if (fsmonitor_ipc__get_state() == IPC_STATE__LISTENING)
-		die("fsmonitor--daemon is already running '%s'",
+		die(_("fsmonitor--daemon is already running '%s'"),
 		    the_repository->worktree);
 
-	printf(_("starting fsmonitor-daemon in '%s'\n"),
-	       the_repository->worktree);
-	fflush(stdout);
+	if (fsmonitor__announce_startup) {
+		fprintf(stderr, _("starting fsmonitor-daemon in '%s'\n"),
+			the_repository->worktree);
+		fflush(stderr);
+	}
 
-	/*
-	 * Run the actual daemon in a background process.
-	 */
-	ret = spawn_fsmonitor(&pid_child);
-	if (pid_child <= 0)
-		return ret;
+	cp.git_cmd = 1;
 
-	/*
-	 * Wait (with timeout) for the background child process get
-	 * started and begin listening on the socket/pipe.  This makes
-	 * the "start" command more synchronous and more reliable in
-	 * tests.
-	 */
-	ret = wait_for_startup(pid_child);
+	strvec_push(&cp.args, "fsmonitor--daemon");
+	strvec_push(&cp.args, "run");
+	strvec_push(&cp.args, "--detach");
+	strvec_pushf(&cp.args, "--ipc-threads=%d", fsmonitor__ipc_threads);
 
-	return ret;
+	cp.no_stdin = 1;
+	cp.no_stdout = 1;
+	cp.no_stderr = 1;
+	cp.close_fd_above_stderr = 1;
+
+	sbgr = start_bg_command(&cp, bg_wait_cb, NULL,
+				fsmonitor__start_timeout_sec);
+
+	switch (sbgr) {
+	case SBGR_READY:
+		return 0;
+
+	default:
+	case SBGR_ERROR:
+	case SBGR_CB_ERROR:
+		return error(_("daemon failed to start"));
+
+	case SBGR_TIMEOUT:
+		return error(_("daemon not online yet"));
+
+	case SBGR_DIED:
+		return error(_("daemon terminated"));
+	}
 }
 
-int cmd_fsmonitor__daemon(int argc, const char **argv, const char *prefix)
+int cmd_fsmonitor__daemon(int argc,
+			  const char **argv,
+			  const char *prefix,
+			  struct repository *repo UNUSED)
 {
 	const char *subcmd;
-	int free_console = 0;
+	enum fsmonitor_reason reason;
+	int detach_console = 0;
 
 	struct option options[] = {
-		OPT_BOOL(0, "free-console", &free_console, N_("free console")),
+		OPT_BOOL(0, "detach", &detach_console, N_("detach from console")),
 		OPT_INTEGER(0, "ipc-threads",
 			    &fsmonitor__ipc_threads,
 			    N_("use <n> ipc worker threads")),
 		OPT_INTEGER(0, "start-timeout",
 			    &fsmonitor__start_timeout_sec,
-			    N_("Max seconds to wait for background daemon startup")),
+			    N_("max seconds to wait for background daemon startup")),
 
 		OPT_END()
 	};
 
-	if (argc < 2)
-		usage_with_options(builtin_fsmonitor__daemon_usage, options);
-
-	if (argc == 2 && !strcmp(argv[1], "-h"))
-		usage_with_options(builtin_fsmonitor__daemon_usage, options);
-
-	git_config(fsmonitor_config, NULL);
-
-	subcmd = argv[1];
-	argv--;
-	argc++;
+	repo_config(the_repository, fsmonitor_config, NULL);
 
 	argc = parse_options(argc, argv, prefix, options,
 			     builtin_fsmonitor__daemon_usage, 0);
+	if (argc != 1)
+		usage_with_options(builtin_fsmonitor__daemon_usage, options);
+	subcmd = argv[0];
+
 	if (fsmonitor__ipc_threads < 1)
 		die(_("invalid 'ipc-threads' value (%d)"),
 		    fsmonitor__ipc_threads);
 
 	prepare_repo_settings(the_repository);
-
+	/*
+	 * If the repo is fsmonitor-compatible, explicitly set IPC-mode
+	 * (without bothering to load the `core.fsmonitor` config settings).
+	 *
+	 * If the repo is not compatible, the repo-settings will be set to
+	 * incompatible rather than IPC, so we can use one of the __get
+	 * routines to detect the discrepancy.
+	 */
 	fsm_settings__set_ipc(the_repository);
-	if (fsm_settings__get_mode(the_repository) == FSMONITOR_MODE_INCOMPATIBLE) {
-		struct strbuf buf_reason = STRBUF_INIT;
-		fsm_settings__get_reason(the_repository, &buf_reason);
-		error("%s '%s'", buf_reason.buf, xgetcwd());
-		strbuf_release(&buf_reason);
-		return -1;
-	}
+
+	reason = fsm_settings__get_reason(the_repository);
+	if (reason > FSMONITOR_REASON_OK)
+		die("%s",
+		    fsm_settings__get_incompatible_msg(the_repository,
+						       reason));
 
 	if (!strcmp(subcmd, "start"))
 		return !!try_to_start_background_daemon();
 
 	if (!strcmp(subcmd, "run"))
-		return !!try_to_run_foreground_daemon(free_console);
+		return !!try_to_run_foreground_daemon(detach_console);
 
 	if (!strcmp(subcmd, "stop"))
 		return !!do_as_client__send_stop();
@@ -1579,14 +1631,14 @@ int cmd_fsmonitor__daemon(int argc, const char **argv, const char *prefix)
 }
 
 #else
-int cmd_fsmonitor__daemon(int argc, const char **argv, const char *prefix)
+int cmd_fsmonitor__daemon(int argc, const char **argv, const char *prefix UNUSED, struct repository *repo UNUSED)
 {
 	struct option options[] = {
 		OPT_END()
 	};
 
-	if (argc == 2 && !strcmp(argv[1], "-h"))
-		usage_with_options(builtin_fsmonitor__daemon_usage, options);
+	show_usage_with_options_if_asked(argc, argv,
+					 builtin_fsmonitor__daemon_usage, options);
 
 	die(_("fsmonitor--daemon not supported on this platform"));
 }
